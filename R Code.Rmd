@@ -1,0 +1,534 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Load Library
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(readr)
+library(skimr)
+library(janitor)
+library(tidymodels)
+library(xgboost)
+library(reshape2)
+library(broom)
+library(vip)
+library(solitude)
+library(ggpubr)
+library(rpart.plot)
+library(doParallel)
+library(parallelly)
+library(magrittr)
+library(DALEX)    
+library(DALEXtra)
+library(ggplot2)
+library(dplyr)
+```
+
+# Data
+
+```{r, warning=FALSE, message=FALSE}
+transac <- read_csv("smilegate_1M_transactions.csv")
+labels <- read_csv("smilegate_1M_labels.csv")
+```
+
+# Skim data
+
+```{r}
+skim(transac)
+skim(labels)
+
+head(transac)
+head(labels)
+```
+
+# Explore
+
+```{r}
+options(scipen = 999)
+num_stat <- transac %>%
+   pivot_longer(cols = is.numeric, names_to = "column", values_to = "value") %>%
+   dplyr::select(column, value) %>%
+   group_by(column) %>%
+   summarise(count = n(),
+             val_miss = sum(is.na(value)),
+             n_dis = n_distinct(value),
+             mean = mean(value, na.rm = TRUE),
+             med = median(value, na.rm = TRUE),
+             max = max(value, na.rm = TRUE),
+             min = min(value, na.rm = TRUE),
+             std = sd(value, na.rm = TRUE)
+             )
+num_stat
+
+for (col in num_stat$column){
+  histo <- transac %>%
+  ggplot(aes(!!as.name(col)))+
+  geom_histogram(bins=30) +
+  labs(title = paste("Histogram of" , as.name(col))) +
+  ylab("pct")+ xlab(as.name(col))
+  print(histo)
+}
+```
+
+# Split
+
+```{r}
+set.seed(123)
+
+split <- initial_split(transac, prop = 0.7)
+
+train <- training(split)
+
+test <- testing(split)
+```
+
+# Create Recipe
+
+```{r}
+the_recipe <- recipe(~ ., data = train)%>% 
+  step_rm(ip_address, email_address, transaction_id, EVENT_TIMESTAMP, account_id) %>% 
+  step_impute_median(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors())
+
+the_bake <- bake(the_recipe %>% prep(), train )
+
+skim(the_bake)
+```
+
+# Fit
+
+```{r}
+iso_forest <- isolationForest$new(
+  sample_size = 2048,
+  num_trees = 100,
+  max_depth = 12)
+
+
+if_fit <- iso_forest$fit(the_bake)
+```
+
+# Train Threshold
+
+```{r}
+if_train <- iso_forest$predict(the_bake)
+
+skim(if_train)
+
+if_train %>%
+  ggplot(aes(average_depth)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 10, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title = "Isolation Forest Average Tree Depth" )
+
+if_train %>%
+  ggplot(aes(anomaly_score)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 0.62, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title="Isolation Forest Anomaly Score Above 0.62")
+```
+
+# Test Threshold
+
+```{r}
+
+the_recipe <- recipe(~ ., data = test)%>% 
+  step_rm(ip_address, email_address, transaction_id, EVENT_TIMESTAMP, account_id) %>% 
+  step_impute_median(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors())
+
+test_bake <- bake(the_recipe %>% prep(), test )
+
+if_test <- iso_forest$predict(test_bake)
+
+
+if_test %>%
+  ggplot(aes(average_depth)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 10, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title = "Isolation Forest Average Tree Depth" )
+
+if_test %>%
+  ggplot(aes(anomaly_score)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 0.62, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title="Isolation Forest Anomaly Score Above 0.62")
+```
+
+# Create Synthetic Labels
+
+```{r}
+synth_train <- bind_cols(if_train, train) %>%
+  mutate(synthetic_target = as.factor(
+      if_else(average_depth <= 10,"fraud","legit")),
+         synthetic_target2 = as.factor(
+           if_else(anomaly_score >= 0.62,"fraud","legit"))
+         )
+
+synth_train %>% 
+count(synthetic_target,synthetic_target2)
+
+
+synth_test <- bind_cols(if_test, test) %>%
+  mutate(synthetic_target = as.factor(
+      if_else(average_depth <= 10,"fraud","legit")),
+         synthetic_target2 = as.factor(
+           if_else(anomaly_score >= 0.62,"fraud","legit"))
+         )
+
+synth_test %>% 
+count(synthetic_target,synthetic_target2)
+
+
+head(synth_test)
+head(synth_train)
+```
+
+# Combine Data
+
+```{r}
+train_join <- merge(x = synth_train, y = labels, by =	
+"transaction_id") %>% 
+  mutate(synthetic_target = as.factor(synthetic_target),
+         synthetic_target2 = as.factor(synthetic_target2),
+         EVENT_LABEL = as.factor(EVENT_LABEL))
+
+test_join <- merge(x = synth_test, y = labels, by =	
+"transaction_id") %>% 
+    mutate(synthetic_target = as.factor(synthetic_target),
+         synthetic_target2 = as.factor(synthetic_target2),
+         EVENT_LABEL = as.factor(EVENT_LABEL))
+
+head(train_join)
+head(test_join)
+```
+
+# Evaluation
+
+```{r}
+train_join %>%
+  recall(EVENT_LABEL, synthetic_target)
+
+train_join %>%
+  recall(EVENT_LABEL, synthetic_target2)
+
+test_join %>%
+  recall(EVENT_LABEL, synthetic_target)
+
+test_join %>%
+  recall(EVENT_LABEL, synthetic_target2)
+```
+
+# Predict Synthetic Target
+
+```{r}
+recipe1 <- recipe(synthetic_target ~ ., data = train_join)%>% 
+  step_rm(ip_address, email_address, transaction_id, EVENT_TIMESTAMP, account_id, synthetic_target2, EVENT_LABEL, id, average_depth, anomaly_score) %>% 
+  step_impute_median(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors())
+
+bake1 <- bake(recipe1 %>% prep(), train_join)
+
+skim(bake1)
+```
+
+```{r}
+rf_model <- rand_forest(trees = 100, 
+                        min_n = 5) %>% 
+  set_engine("ranger", importance="permutation") %>% 
+  set_mode("classification")
+
+rf_workflow1 <- workflow() %>%
+  add_recipe(recipe1) %>%
+  add_model(rf_model) %>% 
+  fit(train_join)
+```
+
+```{r}
+options(yardstick.event_first = TRUE)
+
+predict(rf_workflow1, train_join, type = "prob") %>%
+  bind_cols(predict(rf_workflow1, train_join, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., train_join) -> rf_scored_train1
+
+predict(rf_workflow1, test_join, type = "prob") %>%
+  bind_cols(predict(rf_workflow1, test_join, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., test_join) -> rf_scored_test1
+
+head(rf_scored_test1)
+head(rf_scored_train1)
+```
+
+```{r}
+bind_rows (rf_scored_train1, rf_scored_test1)  %>%
+  group_by(part) %>% 
+  metrics(synthetic_target, .pred_fraud, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss', 'kap')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+```{r}
+bind_rows(rf_scored_train1, rf_scored_test1) %>%
+  group_by(part) %>%
+  recall(synthetic_target, .pred_class)
+
+bind_rows(rf_scored_train1, rf_scored_test1) %>%
+  group_by(part) %>%
+  precision(synthetic_target, .pred_class)
+```
+
+
+
+# Predict Synthetic Target2
+
+```{r}
+recipe2 <- recipe(synthetic_target2 ~ ., data = train_join)%>% 
+  step_rm(ip_address, email_address, transaction_id, EVENT_TIMESTAMP, account_id, synthetic_target, EVENT_LABEL, id, average_depth, anomaly_score) %>% 
+  step_impute_median(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors())
+
+bake2 <- bake(recipe2 %>% prep(), train_join)
+
+skim(bake2)
+```
+
+```{r}
+rf_model <- rand_forest(trees = 100, 
+                        min_n = 5) %>% 
+  set_engine("ranger", importance="permutation") %>% 
+  set_mode("classification")
+
+rf_workflow2 <- workflow() %>%
+  add_recipe(recipe2) %>%
+  add_model(rf_model) %>% 
+  fit(train_join)
+```
+
+```{r}
+options(yardstick.event_first = TRUE)
+
+predict(rf_workflow2, train_join, type = "prob") %>%
+  bind_cols(predict(rf_workflow2, train_join, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., train_join) -> rf_scored_train2
+
+predict(rf_workflow2, test_join, type = "prob") %>%
+  bind_cols(predict(rf_workflow2, test_join, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., test_join) -> rf_scored_test2
+
+head(rf_scored_test2)
+head(rf_scored_train2)
+```
+
+```{r}
+options(yardstick.event_first = TRUE)
+bind_rows (rf_scored_train2, rf_scored_test2)  %>%
+  group_by(part) %>% 
+  metrics(synthetic_target2, .pred_fraud, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss', 'kap')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+```{r}
+bind_rows(rf_scored_train2, rf_scored_test2) %>%
+  group_by(part) %>%
+  recall(synthetic_target, .pred_class)
+
+bind_rows(rf_scored_train2, rf_scored_test2) %>%
+  group_by(part) %>%
+  precision(synthetic_target, .pred_class)
+```
+
+# Predict Event Label
+
+```{r}
+recipe3 <- recipe(EVENT_LABEL ~ ., data = train_join)%>% 
+  step_rm(ip_address, email_address, transaction_id, EVENT_TIMESTAMP, account_id, synthetic_target2, synthetic_target, id, average_depth, anomaly_score) %>% 
+  step_impute_median(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors())
+
+bake3 <- bake(recipe3 %>% prep(), train_join)
+
+skim(bake3)
+```
+
+```{r}
+rf_model <- rand_forest(trees = 100, 
+                        min_n = 5) %>% 
+  set_engine("ranger", importance="permutation") %>% 
+  set_mode("classification")
+
+rf_workflow3 <- workflow() %>%
+  add_recipe(recipe3) %>%
+  add_model(rf_model) %>% 
+  fit(train_join)
+```
+
+```{r}
+options(yardstick.event_first = TRUE)
+
+predict(rf_workflow3, train_join, type = "prob") %>%
+  bind_cols(predict(rf_workflow3, train_join, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., train_join) -> rf_scored_train3
+
+predict(rf_workflow3, test_join, type = "prob") %>%
+  bind_cols(predict(rf_workflow3, test_join, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., test_join) -> rf_scored_test3
+
+head(rf_scored_test3)
+head(rf_scored_train3)
+```
+
+```{r}
+bind_rows (rf_scored_train3, rf_scored_test3)  %>%
+  group_by(part) %>% 
+  metrics(EVENT_LABEL, .pred_fraud, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss', 'kap')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+```{r}
+bind_rows(rf_scored_train3, rf_scored_test3) %>%
+  group_by(part) %>%
+  recall(EVENT_LABEL, .pred_class)
+
+bind_rows(rf_scored_train3, rf_scored_test3) %>%
+  group_by(part) %>%
+  precision(EVENT_LABEL, .pred_class)
+```
+
+# Top 10 Explain - EVENT LABEL
+
+```{r}
+rf_top_TP3 <- rf_scored_test3 %>%
+  filter(EVENT_LABEL == "fraud") %>%
+  slice_max(order_by = .pred_fraud, n=10) %>% 
+  filter(id == "51337" | id == "126905" | id =="19092" | id == "41053" | id == "151297" | id ==  "103662" | id ==  "77782" | id ==  "92139" | id == "61972" | id == "24680")
+
+rf_top_TP3
+```
+
+```{r}
+set.seed(626)
+train_sample <- train_join[sample(1:nrow(train_join), size = 1000), ]  
+
+rf_top10_explainer3 <- explain_tidymodels(
+    rf_workflow3,    
+    data = train_sample,    
+    y = train_sample$EVENT_LABEL,
+    predict_function_target_column = "fraud",
+    verbose = FALSE
+  )
+
+rf_explain_prediction3 <- function(single_record3){
+rf_record_breakdown3 <- predict_parts(explainer = rf_top10_explainer3, 
+                               new_observation = single_record3)
+
+rf_record_breakdown3 %>% plot() %>% print()
+
+rf_record_breakdown3 %>%
+  as_tibble() -> rf_breakdown_data3 
+
+single_record3 %>% 
+ gather(key="variable_name",value="value") -> prediction_data3
+
+prediction_prob3 <- single_record3[,".pred_fraud"] %>% mutate(.pred_fraud = round(.pred_fraud,3)) %>% pull() 
+
+rf_breakdown_data3 %>% 
+  inner_join(prediction_data3) %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  group_by(variable) %>%
+  summarize(contribution = mean(contribution)) %>%
+  mutate(contribution = round(contribution,3),
+         sign = if_else(contribution < 0, "neg","pos")) %>%
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution))+
+  labs(
+    title = "BREAKDOWN explainations",
+    subtitle = paste("predicted probablity = ",prediction_prob3) ,
+                    x="contribution",
+                    y="features")
+  
+}
+
+```
+
+```{r}
+for (row in 1:nrow(rf_top_TP3)) {
+    s_record <- rf_top_TP3[row,]
+    rf_explain_prediction3(s_record)
+} 
+```
+
+# Top 10 Explain - Synthetic Target
+
+```{r}
+rf_top_TP1 <- rf_scored_test1 %>%
+  filter(synthetic_target == "fraud") %>%
+  slice_max(order_by = .pred_fraud, n=10) %>% 
+  filter(id == "69702" | id == "290017" | id =="115859" | id == "190568" | id == "44443" | id ==  "103507" | id ==  "84475" | id ==  "148696" | id == "102354" | id == "24680")
+
+rf_top_TP1
+```
+
+```{r}
+rf_top10_explainer1 <- explain_tidymodels(
+    rf_workflow1,    
+    data = train_sample,    
+    y = train_sample$synthetic_target,
+    predict_function_target_column = "fraud",
+    verbose = FALSE
+  )
+
+rf_explain_prediction1 <- function(single_record1){
+rf_record_breakdown1 <- predict_parts(explainer = rf_top10_explainer1, 
+                               new_observation = single_record1)
+
+rf_record_breakdown1 %>% plot() %>% print()
+
+rf_record_breakdown1 %>%
+  as_tibble() -> rf_breakdown_data1 
+
+single_record1 %>% 
+ gather(key="variable_name",value="value") -> prediction_data1 
+
+prediction_prob1 <- single_record1[,".pred_fraud"] %>% mutate(.pred_fraud = round(.pred_fraud,3)) %>% pull() 
+
+rf_breakdown_data1 %>% 
+  inner_join(prediction_data1) %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  group_by(variable) %>%
+  summarize(contribution = mean(contribution)) %>%
+  mutate(contribution = round(contribution,3),
+         sign = if_else(contribution < 0, "neg","pos")) %>%
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution))+
+  labs(
+    title = "BREAKDOWN explainations",
+    subtitle = paste("predicted probablity = ",prediction_prob1) ,
+                    x="contribution",
+                    y="features")
+  
+}
+
+```
+
+```{r}
+for (row in 1:nrow(rf_top_TP1)) {
+    s_record <- rf_top_TP1[row,]
+    rf_explain_prediction1(s_record)
+} 
+```
